@@ -22,81 +22,22 @@
     <script>
         const canvas = document.getElementById('canvas');
         const ctx = canvas.getContext('2d');
-        
-        let springs = [];
-        let positions = [];
-        let activations = [];
-        let centerOfMass = [0, 0];
+
+        let panelOrder = ['00', '01', '10', '11'];
+        const panelState = {};
         let currentStep = 0;
-        
-        // UI elements
+
         const actualFpsDisplay = document.getElementById('actualFps');
         const stepDisplay = document.getElementById('stepDisplay');
-        
-        let currentColormap = 'magma';
-        
-        // Canvas setup
+
         function resizeCanvas() {
             canvas.width = window.innerWidth;
             canvas.height = window.innerHeight;
         }
         window.addEventListener('resize', resizeCanvas);
         resizeCanvas();
-        
-        // Colormap definitions
+
         const colormaps = {
-            viridis: [
-                [0.267004, 0.004874, 0.329415],
-                [0.282327, 0.140926, 0.457517],
-                [0.253935, 0.265254, 0.529983],
-                [0.206756, 0.371758, 0.553117],
-                [0.163625, 0.471133, 0.558148],
-                [0.127568, 0.566949, 0.550556],
-                [0.134692, 0.658636, 0.517649],
-                [0.266941, 0.748751, 0.440573],
-                [0.477504, 0.821444, 0.318195],
-                [0.741388, 0.873449, 0.149561],
-                [0.993248, 0.906157, 0.143936]
-            ],
-            plasma: [
-                [0.050383, 0.029803, 0.527975],
-                [0.254627, 0.013882, 0.615419],
-                [0.417642, 0.000564, 0.658390],
-                [0.562738, 0.051545, 0.641509],
-                [0.692840, 0.165141, 0.564522],
-                [0.798216, 0.280197, 0.469538],
-                [0.881443, 0.392529, 0.383229],
-                [0.949217, 0.517763, 0.295662],
-                [0.988260, 0.652325, 0.211364],
-                [0.988648, 0.809579, 0.145357],
-                [0.940015, 0.975158, 0.131326]
-            ],
-            turbo: [
-                [0.18995, 0.07176, 0.23217],
-                [0.25107, 0.25237, 0.63374],
-                [0.19549, 0.45850, 0.86924],
-                [0.12394, 0.63319, 0.85315],
-                [0.23304, 0.77508, 0.67314],
-                [0.47961, 0.87612, 0.44579],
-                [0.73006, 0.93740, 0.25597],
-                [0.91890, 0.91640, 0.17703],
-                [0.99324, 0.76934, 0.15501],
-                [0.96580, 0.52957, 0.14575],
-                [0.84299, 0.28068, 0.11851]
-            ],
-            coolwarm: [
-                [0.229739, 0.298717, 0.753683],
-                [0.346476, 0.444423, 0.858177],
-                [0.489152, 0.591687, 0.936514],
-                [0.641509, 0.730526, 0.980907],
-                [0.787892, 0.852873, 0.988989],
-                [0.867993, 0.867993, 0.867993],
-                [0.983868, 0.796564, 0.739153],
-                [0.962552, 0.635266, 0.564522],
-                [0.913099, 0.466163, 0.407843],
-                [0.831373, 0.298039, 0.275163],
-                [0.705882, 0.015686, 0.149020]
-            ],
             magma: [
                 [0.001462, 0.000466, 0.013866],
                 [0.063536, 0.028426, 0.118956],
@@ -111,7 +52,7 @@
                 [0.987053, 0.991438, 0.749504]
             ]
         };
-        
+
         function getColorFromScale(value) {
             value = Math.max(0, Math.min(1, value));
             const cmap = colormaps.magma;
@@ -127,141 +68,167 @@
             const b = Math.floor((c0[2] + t * (c1[2] - c0[2])) * 255);
             return `rgb(${r},${g},${b})`;
         }
-        
-        function worldToScreen(x, y) {
-            // Scale factor (pixels per world unit) - moderate zoom
-            const scale = 600;
-            // Center of canvas - shift view up more
-            const cx = canvas.width / 2;
-            const cy = canvas.height * 0.8;  // Ground at 80% down the screen
-            // Translate world coordinates by center of mass (camera follows robot)
-            const offsetX = x - centerOfMass[0];
-            const offsetY = y;
-            // Convert: y-axis points up in simulation, down in canvas
+
+        function worldToPanelScreen(panelRect, cameraX, x, y) {
+            const scale = panelRect.h * 0.68;
+            const cx = panelRect.x + panelRect.w * 0.5;
+            const cy = panelRect.y + panelRect.h * 0.82;
             return {
-                x: cx + offsetX * scale,
-                y: cy - offsetY * scale
+                x: cx + (x - cameraX) * scale,
+                y: cy - y * scale
             };
         }
-        
-        function draw() {
-            // Clear canvas - light blue-gray background
-            ctx.fillStyle = '#c5d5e0';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-            
-            // Draw ground grid to show movement
-            const gridSpacing = 0.5; // Grid every 0.5 world units
-            const numLines = Math.ceil(canvas.width / 600 / gridSpacing) + 2;
-            const startX = Math.floor(centerOfMass[0] / gridSpacing) * gridSpacing - numLines/2 * gridSpacing;
-            
-            const groundY = worldToScreen(0, 0.02).y;
-            
-            // Draw vertical grid lines - medium blue
-            ctx.strokeStyle = '#6b8ca3';
+
+        function drawPanel(panelRect, panel) {
+            ctx.fillStyle = '#d6e2ea';
+            ctx.fillRect(panelRect.x, panelRect.y, panelRect.w, panelRect.h);
+
+            ctx.strokeStyle = '#9fb3c1';
             ctx.lineWidth = 2;
-            for (let i = 0; i < numLines; i++) {
-                const worldX = startX + i * gridSpacing;
-                const screenPos = worldToScreen(worldX, 0);
-                
-                ctx.beginPath();
-                ctx.moveTo(screenPos.x, groundY);
-                ctx.lineTo(screenPos.x, canvas.height);
-                ctx.stroke();
-            }
-            
-            // Draw tick marks on ground line (every 0.5 units) - dark blue
-            ctx.strokeStyle = '#3d5a6b';
-            ctx.lineWidth = 3;
-            for (let i = 0; i < numLines; i++) {
-                const worldX = startX + i * gridSpacing;
-                const screenPos = worldToScreen(worldX, 0);
-                
-                ctx.beginPath();
-                ctx.moveTo(screenPos.x, groundY - 8);
-                ctx.lineTo(screenPos.x, groundY + 8);
-                ctx.stroke();
-            }
-            
-            // Draw main ground line - darker blue
-            ctx.strokeStyle = '#4a6b80';
-            ctx.lineWidth = 3;
+            ctx.strokeRect(panelRect.x + 1, panelRect.y + 1, panelRect.w - 2, panelRect.h - 2);
+
+            // Clip all world rendering into the current panel bounds.
+            ctx.save();
             ctx.beginPath();
-            ctx.moveTo(0, groundY);
-            ctx.lineTo(canvas.width, groundY);
-            ctx.stroke();
-            
-            if (positions.length === 0) return;
-            
-            // Draw springs
-            ctx.lineWidth = 3;
-            for (let i = 0; i < springs.length; i++) {
-                const spring = springs[i];
-                const p1 = positions[spring[0]];
-                const p2 = positions[spring[1]];
-                
-                if (!p1 || !p2) continue;
-                
-                const s1 = worldToScreen(p1[0], p1[1]);
-                const s2 = worldToScreen(p2[0], p2[1]);
-                
-                // Color by activation
-                const act = activations[i] !== undefined ? activations[i] : 0.5;
-                ctx.strokeStyle = getColorFromScale(act);
-                
+            ctx.rect(panelRect.x + 2, panelRect.y + 2, panelRect.w - 4, panelRect.h - 4);
+            ctx.clip();
+
+            if (!panel) {
+                ctx.fillStyle = '#2b3a42';
+                ctx.font = '600 18px Arial';
+                ctx.fillText('Waiting for panel data...', panelRect.x + 16, panelRect.y + 36);
+                ctx.restore();
+                return;
+            }
+
+            const cameraX = (panel.center_of_mass && panel.center_of_mass[0]) ? panel.center_of_mass[0] : 0.0;
+
+            if (panel.terrain_profile && panel.terrain_profile.length > 1) {
+                ctx.strokeStyle = '#4a6b80';
+                ctx.lineWidth = 2.5;
                 ctx.beginPath();
-                ctx.moveTo(s1.x, s1.y);
-                ctx.lineTo(s2.x, s2.y);
+                panel.terrain_profile.forEach((pt, idx) => {
+                    const s = worldToPanelScreen(panelRect, cameraX, pt[0], pt[1]);
+                    if (idx === 0) {
+                        ctx.moveTo(s.x, s.y);
+                    } else {
+                        ctx.lineTo(s.x, s.y);
+                    }
+                });
                 ctx.stroke();
             }
-            
-            // Draw masses
-            ctx.fillStyle = '#FFD166';
-            for (let i = 0; i < positions.length; i++) {
-                const pos = positions[i];
-                if (!pos) continue;
-                
-                const screen = worldToScreen(pos[0], pos[1]);
-                
-                ctx.beginPath();
-                ctx.arc(screen.x, screen.y, 5, 0, 2 * Math.PI);
-                ctx.fill();
+
+            if (panel.positions && panel.springs) {
+                ctx.lineWidth = 2.2;
+                for (let i = 0; i < panel.springs.length; i++) {
+                    const spring = panel.springs[i];
+                    const p1 = panel.positions[spring[0]];
+                    const p2 = panel.positions[spring[1]];
+                    if (!p1 || !p2) continue;
+                    const s1 = worldToPanelScreen(panelRect, cameraX, p1[0], p1[1]);
+                    const s2 = worldToPanelScreen(panelRect, cameraX, p2[0], p2[1]);
+                    const act = panel.activations && panel.activations[i] !== undefined ? panel.activations[i] : 0.0;
+                    const normAct = 0.5 + 0.5 * Math.tanh(act);
+                    ctx.strokeStyle = getColorFromScale(normAct);
+                    ctx.beginPath();
+                    ctx.moveTo(s1.x, s1.y);
+                    ctx.lineTo(s2.x, s2.y);
+                    ctx.stroke();
+                }
+                ctx.fillStyle = '#FFD166';
+                for (const pos of panel.positions) {
+                    if (!pos) continue;
+                    const s = worldToPanelScreen(panelRect, cameraX, pos[0], pos[1]);
+                    ctx.beginPath();
+                    ctx.arc(s.x, s.y, 3.8, 0, 2 * Math.PI);
+                    ctx.fill();
+                }
+            }
+
+            ctx.restore();
+
+            const textX = panelRect.x + panelRect.w - 10;
+            ctx.textAlign = 'right';
+            ctx.fillStyle = '#102a43';
+            ctx.font = '700 16px Arial';
+            ctx.fillText((panel.title || panel.id).replace(/Spread/g, 'Sparse'), textX, panelRect.y + 24);
+
+            ctx.font = '600 13px Arial';
+            const coverageText = `coverage: ${(panel.coverage || 0).toFixed(3)}`;
+            const morphText = `morph: ${panel.morphology_reward === 'spread' ? 'sparse' : 'normal'}`;
+            const styleText = `style: ${panel.movement_style || 'neutral'}`;
+            ctx.fillText(coverageText, textX, panelRect.y + 44);
+            ctx.fillText(morphText, textX, panelRect.y + 62);
+            ctx.fillText(styleText, textX, panelRect.y + 80);
+            ctx.textAlign = 'left';
+        }
+
+        function draw() {
+            ctx.fillStyle = '#0f1720';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            const margin = 10;
+            const panelW = (canvas.width - margin * 3) / 2;
+            const panelH = (canvas.height - margin * 3) / 2;
+            const rects = [
+                { x: margin, y: margin, w: panelW, h: panelH },
+                { x: margin * 2 + panelW, y: margin, w: panelW, h: panelH },
+                { x: margin, y: margin * 2 + panelH, w: panelW, h: panelH },
+                { x: margin * 2 + panelW, y: margin * 2 + panelH, w: panelW, h: panelH }
+            ];
+
+            for (let i = 0; i < 4; i++) {
+                const panelId = panelOrder[i];
+                drawPanel(rects[i], panelState[panelId]);
             }
         }
-        
-        // Start event stream
+
         function startStream() {
             const es = new EventSource('/stream');
-            
+
             es.onmessage = (event) => {
                 if (!event.data) return;
-                
                 const msg = JSON.parse(event.data);
-                
-                if (msg.type === 'topology') {
-                    springs = msg.springs;
-                    console.log(`Loaded robot: ${msg.n_masses} masses, ${msg.n_springs} springs`);
-                } else if (msg.type === 'step') {
-                    positions = msg.positions;
-                    activations = msg.activations;
-                    centerOfMass = msg.center_of_mass || [0, 0];
-                    currentStep = msg.step;
-                    
+
+                if (msg.type === 'topology_batch') {
+                    if (msg.panels && msg.panels.length === 4) {
+                        const orderedPanels = [...msg.panels].sort((a, b) => String(a.id).localeCompare(String(b.id)));
+                        panelOrder = orderedPanels.map(p => p.id);
+                    }
+                    for (const panel of msg.panels || []) {
+                        panelState[panel.id] = {
+                            ...(panelState[panel.id] || {}),
+                            ...panel,
+                            positions: [],
+                            activations: [],
+                            center_of_mass: [0, 0],
+                            coverage: 0.0,
+                        };
+                    }
+                    draw();
+                } else if (msg.type === 'step_batch') {
+                    for (const panel of msg.panels || []) {
+                        panelState[panel.id] = {
+                            ...(panelState[panel.id] || {}),
+                            ...panel,
+                            springs: (panelState[panel.id] || {}).springs || [],
+                            terrain_profile: (panelState[panel.id] || {}).terrain_profile || []
+                        };
+                        currentStep = Math.max(currentStep, panel.step || 0);
+                    }
                     stepDisplay.textContent = currentStep;
-                    
                     if (msg.fps !== undefined) {
                         actualFpsDisplay.textContent = msg.fps.toFixed(0);
                     }
-                    
                     draw();
                 }
             };
-            
+
             es.onerror = (error) => {
                 console.error('EventSource error:', error);
             };
         }
-        
-        // Initialize
+
         window.addEventListener('load', () => {
             startStream();
             draw();

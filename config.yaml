@@ -1,4 +1,4 @@
-seed: 0 # Set the random seed for reproducibility
+seed: 42 # Set the random seed for reproducibility
 
 ## Taichi configuration parameters
 taichi:
@@ -12,15 +12,15 @@ taichi:
 # Use n_sims to set the number of robots to run in parallel.
 # Use sim_steps to set the number of simulation steps to run for each robot. The default probably does not need to be changed. 
 simulator:
-  n_sims: 16
-  sim_steps: 1000
+  n_sims: 8
+  sim_steps: 2000
   learning_steps: 40
   dt: 3e-3
   eps: 1e-5
-  springA: 0.1
-  springK: 15000.0
+  springA: 0.2
+  springK: 20000.0
   ground_height: 0.02
-  gravity: 10.0
+  gravity: 5.0
   friction: 0.9
   restitution: 0.1
   drag_damping: 10.0
@@ -29,4 +29,13 @@ simulator:
   cpg_omega: 15.0
   adam_beta1: 0.9
   adam_beta2: 0.999
-  learning_rate: 7e-3
+  learning_rate: 5e-3
+  n_material_types: 3
+  default_material_type: 1
+  material_springA: [0.05, 0.15, 0.25]
+  material_springK: [20000.0, 10000.0, 5000.0]
+  # Movement style bonus (run.py sets movement_style per scenario: neutral | jump)
+  movement_style_weight: 6
+  movement_style_alpha: 2.0
+  # Morphology bonus (run.py sets morphology_reward per scenario: none | spread | size)
+  morphology_weight: 0.85

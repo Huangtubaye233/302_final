@@ -10,16 +10,24 @@ architectures = {
 }
 
 vec2 = ti.types.vector(2, ti.f32)
+_TI_INITIALIZED = False
 
 @ti.data_oriented
 class Simulator:
     def __init__(self, sim_config, taichi_config, seed, needs_grad=True):
-        ti.init(
-            arch=architectures[taichi_config["arch"]],
-            default_fp=ti.f32,
-            random_seed=seed,
-            **taichi_config["init"],
-        )
+        global _TI_INITIALIZED
+        if not _TI_INITIALIZED:
+            init_kwargs = dict(taichi_config["init"])
+            # device_memory_GB is CUDA-only; passing it on CPU backends can be unstable on some systems.
+            if taichi_config["arch"] != "cuda" and "device_memory_GB" in init_kwargs:
+                init_kwargs.pop("device_memory_GB")
+            ti.init(
+                arch=architectures[taichi_config["arch"]],
+                default_fp=ti.f32,
+                random_seed=seed,
+                **init_kwargs,
+            )
+            _TI_INITIALIZED = True
         self.needs_grad = needs_grad
         self.config = sim_config
         self.taichi_config = taichi_config
@@ -46,6 +54,15 @@ class Simulator:
         self.adam_beta1 = ti.field(dtype=ti.f32, shape=(), needs_grad=False)
         self.adam_beta2 = ti.field(dtype=ti.f32, shape=(), needs_grad=False)
         self.learning_rate = ti.field(dtype=ti.f32, shape=(), needs_grad=False)
+        self.terrain_type = ti.field(dtype=ti.i32, shape=(), needs_grad=False)
+        self.terrain_amplitude = ti.field(dtype=ti.f32, shape=(), needs_grad=False)
+        self.terrain_frequency = ti.field(dtype=ti.f32, shape=(), needs_grad=False)
+        self.movement_style = ti.field(dtype=ti.i32, shape=(), needs_grad=False)  # 0=neutral, 1=jump
+        self.movement_style_weight = ti.field(dtype=ti.f32, shape=(), needs_grad=False)
+        self.movement_style_alpha = ti.field(dtype=ti.f32, shape=(), needs_grad=False)
+        self.max_material_types = ti.field(dtype=ti.i32, shape=(), needs_grad=False)
+        self.material_A = ti.field(dtype=ti.f32, shape=(8,), needs_grad=False)
+        self.material_K = ti.field(dtype=ti.f32, shape=(8,), needs_grad=False)
         self.n_sims[None] = self.config["n_sims"]
         self.steps[None] = self.config["sim_steps"]
         self.max_n_masses[None] = self.config["n_masses"]
@@ -65,9 +82,30 @@ class Simulator:
         self.adam_beta1[None] = self.config["adam_beta1"]
         self.adam_beta2[None] = self.config["adam_beta2"]
         self.learning_rate[None] = self.config["learning_rate"]
+        self.terrain_type[None] = 1 if self.config.get("terrain_type", "flat") == "rough" else 0
+        self.terrain_amplitude[None] = self.config.get("terrain_amplitude", 0.0)
+        self.terrain_frequency[None] = self.config.get("terrain_frequency", 6.0)
+        style_str = self.config.get("movement_style", "neutral")
+        self.movement_style[None] = 1 if style_str == "jump" else 0
+        self.movement_style_weight[None] = float(self.config.get("movement_style_weight", 0.15))
+        self.movement_style_alpha[None] = float(self.config.get("movement_style_alpha", 2.0))
+        material_as = self.config.get("material_springA", [0.0, self.springA[None], self.springA[None] * 1.6])
+        material_ks = self.config.get("material_springK", [self.springK[None] * 0.8, self.springK[None], self.springK[None] * 1.4])
+        n_types = min(8, len(material_as), len(material_ks))
+        if n_types <= 0:
+            n_types = 1
+            material_as = [self.springA[None]]
+            material_ks = [self.springK[None]]
+        self.max_material_types[None] = n_types
+        self.material_A.fill(0.0)
+        self.material_K.fill(0.0)
+        for i in range(n_types):
+            self.material_A[i] = float(material_as[i])
+            self.material_K[i] = float(material_ks[i])
 
     def allocate_fields(self):
         self.springs = ti.Vector.field(2, dtype=ti.i32, shape=(self.n_sims[None], self.max_n_springs[None],), needs_grad=False)
+        self.spring_types = ti.field(dtype=ti.i32, shape=(self.n_sims[None], self.max_n_springs[None],), needs_grad=False)
         self.springL = ti.field(dtype=ti.f32, shape=(self.n_sims[None], self.max_n_springs[None],), needs_grad=False)
         self.n_masses = ti.field(dtype=ti.i32, shape=(self.n_sims[None],), needs_grad=False)
         self.n_springs = ti.field(dtype=ti.i32, shape=(self.n_sims[None],), needs_grad=False)
@@ -107,11 +145,12 @@ class Simulator:
         self.clear_grads()
         self.reinitialize_robots()
         self.forward()
-        self.compute_loss()
+        self.compute_loss_disp_only()
         self.loss.grad.fill(1.0)
         self.backward()
         self.adam_step[None] += 1
         self.update_weights()
+        self.compute_loss()
         return self.loss.to_numpy()
     
     def evaluation_step(self):
@@ -130,7 +169,7 @@ class Simulator:
         self.compute_com(self.steps[None])
 
     def backward(self):
-        self.compute_loss.grad()
+        self.compute_loss_disp_only.grad()
         self.compute_com.grad(self.steps[None])
         for t in range(self.steps[None]-1, -1, -1):
             self.advance.grad(t + 1)
@@ -139,10 +178,12 @@ class Simulator:
             self.nn1.grad(t)
             self.compute_com.grad(t)
 
-    def initialize(self, masses, springs):
+    def initialize(self, masses, springs, spring_types=None):
         n_robots = len(masses)
         assert n_robots == self.n_sims[None], "The number of robots does not match n_sims in the simulator config"
         self.hard_reset()
+        if spring_types is None:
+            spring_types = [np.ones((np.array(s).shape[0],), dtype=np.int32) for s in springs]
         for i in range(n_robots):
             m = np.array(masses[i])
             assert m.shape[0] > 0, "The number of masses in a robot must be greater than 0"
@@ -152,8 +193,10 @@ class Simulator:
             s = np.array(springs[i])
             assert s.shape[0] > 0, "The number of springs in a robot must be greater than 0"
             assert s.shape[0] <= self.max_n_springs[None], "The number of springs in a robot must be less than or equal to max_n_springs in the simulator config"
+            st = np.array(spring_types[i], dtype=np.int32)
+            assert st.shape[0] == s.shape[0], "spring_types length must match springs length"
             self.initialize_masses(i, m)
-            self.initialize_springs(i, s)
+            self.initialize_springs(i, s, st)
         self.count_hidden_units()
         self.initialize_weights()
 
@@ -168,9 +211,10 @@ class Simulator:
             self.n_masses[i] += 1
 
     @ti.kernel
-    def initialize_springs(self, i: ti.i32, springs: ti.types.ndarray()):
+    def initialize_springs(self, i: ti.i32, springs: ti.types.ndarray(), spring_types: ti.types.ndarray()):
         for j in range(springs.shape[0]):
             self.springs[i, j] = ti.Vector([springs[j, 0], springs[j, 1]], dt=ti.i32)
+            self.spring_types[i, j] = spring_types[j]
             self.springL[i, j] = ti.math.distance(self.x[i, 0, springs[j, 0]], self.x[i, 0, springs[j, 1]])
             self.n_springs[i] += 1
 
@@ -219,11 +263,40 @@ class Simulator:
                 endpoint2 = self.springs[sim_idx, spring_idx][1]
                 dist = self.x[sim_idx, t, endpoint1] - self.x[sim_idx, t, endpoint2]
                 length = dist.norm()
-                target_length = self.springL[sim_idx, spring_idx] * (1 + ti.math.tanh(self.act[sim_idx, t, spring_idx]) * self.springA[None])
-                force = (length - target_length) * self.springK[None] * dist / (length + self.eps[None])
+                material_idx = ti.math.clamp(self.spring_types[sim_idx, spring_idx], 0, self.max_material_types[None] - 1)
+                spring_a = self.material_A[material_idx]
+                spring_k = self.material_K[material_idx]
+                target_length = self.springL[sim_idx, spring_idx] * (1 + ti.math.tanh(self.act[sim_idx, t, spring_idx]) * spring_a)
+                force = (length - target_length) * spring_k * dist / (length + self.eps[None])
                 impulse = self.dt[None] * force
                 self.vinc[sim_idx, t+1, endpoint1] += -impulse
                 self.vinc[sim_idx, t+1, endpoint2] += impulse
+
+    @ti.func
+    def ground_height_at(self, x: ti.f32) -> ti.f32:
+        h = self.ground_height[None]
+        if self.terrain_type[None] == 1:
+            h += self.terrain_amplitude[None] * (
+                ti.math.sin(self.terrain_frequency[None] * x)
+                + 0.4 * ti.math.sin(self.terrain_frequency[None] * 0.5 * x + 1.3)
+            )
+        return h
+
+    @ti.func
+    def ground_slope_at(self, x: ti.f32) -> ti.f32:
+        slope = 0.0
+        if self.terrain_type[None] == 1:
+            slope += self.terrain_amplitude[None] * self.terrain_frequency[None] * ti.math.cos(
+                self.terrain_frequency[None] * x
+            )
+            slope += (
+                self.terrain_amplitude[None]
+                * 0.4
+                * self.terrain_frequency[None]
+                * 0.5
+                * ti.math.cos(self.terrain_frequency[None] * 0.5 * x + 1.3)
+            )
+        return slope
 
     @ti.kernel
     def advance(self, t: ti.i32): 
@@ -234,14 +307,12 @@ class Simulator:
                 newv = damping * self.v[sim_idx, t-1, mass_idx] + g + self.vinc[sim_idx, t, mass_idx]
                 oldx = self.x[sim_idx, t-1, mass_idx]
                 newx = oldx + self.dt[None] * newv
-                if newx[1] < self.ground_height[None]:
-                    toi = (self.ground_height[None] - oldx[1]) / newv[1]
-                    toi = ti.math.clamp(toi, 0.0, self.dt[None])
-                    newx_toi = oldx + toi * newv
-                    newv_contact = self.v_on_contact(newv, ti.Vector([0.0, 1.0]))
-                    newx_contact = newx_toi + (self.dt[None] - toi) * newv_contact
-                    newx = newx_contact
-                    newv = newv_contact
+                ground_y = self.ground_height_at(newx[0])
+                if newx[1] < ground_y:
+                    slope = self.ground_slope_at(newx[0])
+                    normal = ti.Vector([-slope, 1.0], dt=ti.f32).normalized()
+                    newx = ti.Vector([newx[0], ground_y], dt=ti.f32)
+                    newv = self.v_on_contact(newv, normal)
                 self.x[sim_idx, t, mass_idx] = newx
                 self.v[sim_idx, t, mass_idx] = newv
 
@@ -265,11 +336,31 @@ class Simulator:
                 self.center[sim_idx, t] += self.x[sim_idx, t, mass_idx] / ti.cast(self.n_masses[sim_idx], ti.f32)
 
     @ti.kernel
-    def compute_loss(self):
+    def compute_loss_disp_only(self):
+        """Displacement-only loss; used for backward to avoid Taichi autodiff over long trajectory (segfault on arm64)."""
         for sim_idx in range(self.n_sims[None]):
             com0 = self.center[sim_idx, 0].x
             comt = self.center[sim_idx, self.steps[None]].x
             self.loss[sim_idx] = com0 - comt
+
+    @ti.kernel
+    def compute_loss(self):
+        """Full loss (displacement + optional style bonus) for fitness only; style term is not differentiated."""
+        for sim_idx in range(self.n_sims[None]):
+            com0_x = self.center[sim_idx, 0].x
+            com0_y = self.center[sim_idx, 0].y
+            comt_x = self.center[sim_idx, self.steps[None]].x
+            comt_y = self.center[sim_idx, self.steps[None]].y
+            loss_val = com0_x - comt_x
+            style_coef = ti.cast(self.movement_style[None], ti.f32)
+            log_sum = 0.0
+            for t in range(self.steps[None] + 1):
+                log_sum += ti.exp(self.movement_style_alpha[None] * self.center[sim_idx, t].y)
+            log_sum = ti.log(log_sum + self.eps[None])
+            max_y_surrogate = log_sum / self.movement_style_alpha[None]
+            final_y_gain = comt_y - com0_y
+            loss_val -= self.movement_style_weight[None] * style_coef * (max_y_surrogate + final_y_gain)
+            self.loss[sim_idx] = loss_val
 
     @ti.kernel
     def update_weights(self):
@@ -339,6 +430,7 @@ class Simulator:
         self.n_masses.fill(0)
         self.springL.fill(0.0)
         self.springs.fill(0)
+        self.spring_types.fill(0)
         self.n_springs.fill(0)
         self.act.fill(0.0)
         self.loss.fill(0.0)
